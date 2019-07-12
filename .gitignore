@@ -130,6 +130,7 @@ dmypy.json
 
 ### VisualStudioCode ###
 .vscode/*
+.vscode
 !.vscode/settings.json
 !.vscode/tasks.json
 !.vscode/launch.json
@@ -168,5 +169,6 @@ Temporary Items
 .apdisk
 
 *.db
+backup/*
 
 # End of https://www.gitignore.io/api/python,visualstudiocode

@@ -283,6 +283,4 @@ display_job_list()
 display_timesheet("test")
 display_job("test")
 
-
-
 dbh.close()
