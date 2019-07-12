@@ -3,6 +3,7 @@
 from datetime import date, datetime, timedelta
 from tabulate import tabulate
 import sqlite3 as sql
+from sqlite3 import Error
 import string
 import time
 
@@ -10,10 +11,13 @@ dbh = sql.connect('var/timesheet.db')
 cursor = dbh.cursor()
 
 max_shift = 10 # hours
+debug = False
+dt_format = '%Y-%m-%d %H:%M:%S'
+bk_dir = 'backup/'
 
 # convert sql datetime string to datetime object
 def to_dt(dt_in):
-    return datetime.strptime(dt_in, '%Y-%m-%d %H:%M:%S')
+    return datetime.strptime(dt_in, dt_format)
 
 # convert UTC to local timezone (+1 hour for UK)
 def get_dt_now():
@@ -59,7 +63,8 @@ def prompt_for_time():
         # merge date and time into complete datetime object
         full_date = datetime.combine(m_date, m_time)
         return full_date
-    except:
+
+    except Error as err:
         print ("Couldn't parse date or time input")
         return None
 
@@ -70,7 +75,11 @@ def display_job_list():
     tb_header = ["ID", "Name", "Created", "Client Name", "Client Email"]
     tb_content = []
     # get jobs from database
-    cursor.execute("SELECT * FROM tasksheet")
+    cursor.execute("""
+        SELECT tasksheet.task_id, tasksheet.task_name, tasksheet.created_on, clients.client_name, clients.client_email 
+        FROM tasksheet
+        JOIN clients ON tasksheet.client_id = clients.client_id
+    """)
     for row in cursor:
         tb_content.append([str(row[0]), str(row[1]), str(row[2]), str(row[3])])
 
@@ -84,9 +93,7 @@ def display_timesheet(tsk_name):
     # get timesheet data
     cursor.execute("SELECT * FROM timesheet WHERE task_name = ?", (tsk_name,))
     for row in cursor:
-        # calculate shift duration
-        dur = get_shift_duration(to_dt(row[2]), to_dt(row[3]))
-        tb_content.append([str(row[0]), str(row[1]), str(row[2]), str(row[3]), str(dur)])
+        tb_content.append([str(row[0]), str(row[1]), str(row[2]), str(row[3]), str(row[4])])
 
     print (tabulate(tb_content, tb_header) + "\n")
 
@@ -97,36 +104,55 @@ def display_job(tsk_name):
         tb_header = ["ID", "Name", "Created On", "Client Name", "Business", "Email", "Rate"]
         tb_content = []
         # get job data
-        cursor.execute("SELECT * FROM tasksheet WHERE task_name = ?", (tsk_name,)), 
+        cursor.execute("""
+            SELECT tasksheet.task_id, tasksheet.task_name, tasksheet.created_on, clients.client_name, clients.client_business, clients.client_email, tasksheet.rate
+            FROM tasksheet
+            JOIN clients ON tasksheet.client_id = clients.client_id
+            WHERE tasksheet.task_name = ?
+        """, (tsk_name,)), 
         row = cursor.fetchone()
 
         for i, itm_value in enumerate (tb_header):
             tb_content.append([tb_header[i], row[i]])
 
         print (tabulate(tb_content) + "\n")
-    except:
-        print ("Couldn't find job named: " + tsk_name)
 
-# dev functions
-# clock in as yesterday's date
-def clock_in_yd(tsk_name):
-    cursor.execute("INSERT INTO timesheet(task_name, time_in) VALUES (?, (SELECT datetime('now','-1 day','localtime')) )", (tsk_name,))
-    dbh.commit()
+    except Error as err:
+        print ("Couldn't display job named: " + tsk_name + ".\n" + str(err))
 
-# reload the schema over the database file
-def hard_reset():
+# table i/o functions
+# init the database file with the correct tables in the schema
+def init_database():
     with open('var/schema.sql') as sch:
         cursor.executescript(sch.read())
 
-# table i/o functions
-# create a new timesheet task (job)
-def new_task(tsk_name, c_name, c_business, c_email, rate):
+# create a new client
+def new_client(c_name, c_business, c_address, c_email, c_phone):
     try:
-        sql_add_task = ("INSERT INTO tasksheet (task_name, client_name, client_business, client_email, rate) VALUES (?, ?, ?, ?, ?)")
-        cursor.execute(sql_add_task, (tsk_name, c_name, c_business, c_email, rate))
+        sql_add_client = ("INSERT INTO clients (client_name, client_business, client_address, client_email, client_phone) VALUES (?, ?, ?, ?, ?)")
+        cursor.execute(sql_add_client, (c_name, c_business, c_address, c_email, c_phone))
         dbh.commit()
 
-    except (sql.IntegrityError):
+    except (sql.IntegrityError) as err:
+        print ("Can't create new client: " + c_name + ".\n" + str(err))
+        pass
+
+# create a new timesheet task (job)
+def new_task(tsk_name, c_email, rate):
+    try:
+        # find client id from client email
+        cursor.execute("SELECT client_id FROM clients WHERE client_email = ?", (c_email,))
+        row = cursor.fetchone()
+
+        # if the client exists, save the client id with the task
+        if (row is not None):
+            sql_add_task = ("INSERT INTO tasksheet (task_name, client_id, rate) VALUES (?, ?, ?)")
+            cursor.execute(sql_add_task, (tsk_name, row[0], rate))
+            dbh.commit()
+        else:
+            print ("Can't find client with email: " + c_email + "\nDoes the client exist?")
+
+    except (sql.IntegrityError) as err:
         print ("Can't create new task: " + tsk_name + "\nDoes a task with this name already exist?")
         pass   
 
@@ -163,8 +189,8 @@ def clock_out(msg):
                 s_dur = get_shift_duration(to_dt(row[2]), s_end)
 
                 # convert shift end to string and save
-                strs_end = s_end.strftime('%Y-%m-%d %H:%M:%S')
-                cursor.execute("UPDATE timesheet SET time_out = ?, msg = ? WHERE time_id = ?", (strs_end, msg, row[0]))
+                strs_end = s_end.strftime(dt_format)
+                cursor.execute("UPDATE timesheet SET time_out = ?, duration = ?, msg = ? WHERE time_id = ?", (strs_end, s_dur, msg, row[0]))
                 dbh.commit()
 
                 print ("Clocked out of " + row[1] + " at: " + strs_end + "\nShift Duration: " + str(s_dur) + " Hours")  
@@ -175,22 +201,83 @@ def clock_out(msg):
         print("Timesheet is empty!")
 
 # manually enter timesheet data
-def add_shift():
-    return None
+def new_shift(tsk_name, time_in, time_out, msg):
+    try:
+        # validate the shift entry
+        if (validate_shift(time_in, time_out)):
+            # set shift message
+            if (msg is None or msg == ""):
+                s_msg = "no description"
+            else:
+                s_msg = msg
 
-# edit timesheet entry
-def edit_shift():
-    return None
+            # get shift duration
+            s_dur = get_shift_duration(time_in, time_out)          
+            
+            s_summary = (tsk_name, time_in.strftime(dt_format), time_out.strftime(dt_format), s_dur, s_msg)
 
-# edit tasksheet entry
-def edit_job():
-    return None
+            # save shift to database
+            cursor.execute("INSERT INTO timesheet (task_name, time_in, time_out, duration, msg) VALUES (?, ?, ?, ?, ?)", s_summary)
+            dbh.commit()
 
-hard_reset()
-new_task("test", "jon", "dow.inc", "jon@dow.inc", 14.00)
+            print ("New shift added for " + tsk_name + ".\nShift Duration: " + str(s_dur) + " Hours")
+        else:
+            print ("Shift details are invalid")
+
+    except (sql.IntegrityError):
+        print ("Could not find a job entry with name: " + str(tsk_name))
+
+# delete shift
+def del_shift(time_id):
+    try:
+        cursor.execute("DELETE FROM timesheet WHERE time_id = ?", (time_id,))
+        dbh.commit()
+    except Error as e:
+        print ("Could not remove shift entry with id: " + str(time_id))
+    
+# delete the last shift entry for a given job
+def del_last_shift(tsk_name):
+    # find last entered shift for job
+    cursor.execute("SELECT time_id FROM timesheet WHERE task_name = ? ORDER BY time_id DESC LIMIT 1", (str(tsk_name),))
+    row = cursor.fetchone()
+
+    if (row is not None):
+        # delete entry with retrieved ID
+        del_shift(row[0])
+
+        print ("Deleted shift entry with ID: " + str(row[0]) + " for job: " + str(tsk_name))
+    else:
+        print ("Couldn't find any shift entries for job named: " + str(tsk_name))
+
+# create a backup of the database to a new sqlite3.db file
+def backup_db():
+    try:
+        # generate backup name
+        bk_name = str(datetime.now().strftime('%Y%m%d%H%M') + '.sql')
+        # open connection
+        with open((bk_dir + bk_name), 'w') as f:
+            for line in dbh.iterdump():
+                f.write('%s\n' % line)
+        
+
+        print ("Successfully backed up timesheets to: " + bk_name)
+    except Error as err:
+        print ("Could not create backup: " + err)
+        
+
+init_database()
+new_client("jon", "dow.inc", "123 some street, edinburgh, eh10 5aa", "jon@dow.com", "0131 555 6969")
+new_task("test", "jon@dow.com", 14.00)
 
 clock_in('test')
 clock_out("done")
+
+mytime_in = to_dt('2019-07-01 08:00:00')
+mytime_out = to_dt('2019-07-01 17:00:00')
+
+new_shift('test', mytime_in, mytime_out, 'manual test shift')
+backup_db()
+del_last_shift('test')
 
 display_job_list()
 display_timesheet("test")
